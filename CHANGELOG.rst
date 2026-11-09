@@ -7,6 +7,19 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 `Unreleased <https://github.com/jpadilla/pyjwt/compare/2.15.1...HEAD>`__
 -------------------------------------------------------------------------
 
+Fixed
+~~~~~
+
+- Bind the ``cache_keys=True`` signing-key cache to the current JWK Set
+  generation and its ``lifespan``. A successful ``get_jwk_set(refresh=True)``
+  now publishes one complete generation atomically, so revoked ``kid``\ s
+  stop verifying and rotated material with the same ``kid`` resolves to the
+  new key; failed refreshes no longer replace or extend an unexpired cached
+  generation, while an expired generation fails explicitly instead of
+  trusting stale keys. The per-key cache is inactive when
+  ``cache_jwk_set=False`` because there is no TTL-bearing generation to bind
+  to.
+
 Changed
 ~~~~~~~
 

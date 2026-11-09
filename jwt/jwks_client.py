@@ -6,7 +6,7 @@ import math
 import threading
 import time
 import urllib.request
-from functools import lru_cache
+from collections import OrderedDict
 from ssl import SSLContext
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -69,11 +69,18 @@ class PyJWKClient:
 
         **Tier 2 — Signing key cache** (disabled by default):
         Caches individual signing keys (looked up by ``kid``) using an LRU
-        cache with **no time-based expiration**. Keys are evicted only when
-        the cache reaches its maximum size. Controlled by:
+        cache. Every cached key belongs to exactly one published JWK Set
+        generation and is held no longer than that generation's
+        ``lifespan``: refreshing the set atomically starts a new
+        generation, after which a removed ``kid`` fails and rotated
+        material resolves to the new key. Keys are also evicted when the
+        cache reaches its maximum size. Because there is no generation to
+        bind to when Tier 1 is disabled, this cache is only active while
+        ``cache_jwk_set`` is ``True``. Controlled by:
 
-        - ``cache_keys``: Set to ``True`` to enable this cache.
-          Defaults to ``False``.
+        - ``cache_keys``: Set to ``True`` to enable this cache. Has no
+          effect when ``cache_jwk_set`` is ``False``. Defaults to
+          ``False``.
         - ``max_cached_keys``: Maximum number of signing keys to keep in
           the LRU cache. Defaults to ``16``.
 
@@ -138,18 +145,21 @@ class PyJWKClient:
         else:
             self.jwk_set_cache = None
 
-        if cache_keys:
-            # Cache signing keys
-            get_signing_key = lru_cache(maxsize=max_cached_keys)(self.get_signing_key)
-            # Ignore mypy (https://github.com/python/mypy/issues/2427)
-            self.get_signing_key = get_signing_key  # type: ignore[method-assign]
+        self._cache_keys = cache_keys
+        self._max_cached_keys = max_cached_keys
+        # kid -> (generation entry, resolved PyJWK). Only populated while a
+        # JWK Set cache is active, since an entry is the TTL-bearing unit
+        # the key cache is bound to.
+        self._signing_key_cache: OrderedDict[str, tuple[Any, PyJWK]] = OrderedDict()
 
     def fetch_data(self) -> Any:
         """Fetch the JWK Set from the JWKS endpoint.
 
         Makes an HTTP request to the configured ``uri`` and returns the
-        parsed JSON response. If the JWK Set cache is enabled, the
-        response is stored in the cache.
+        parsed JSON response. The response is validated before it is
+        returned; publication into the JWK Set cache happens afterwards via
+        :meth:`get_jwk_set`, so a network or parsing failure never replaces
+        or extends a still-valid cached generation.
 
         :returns: The parsed JWK Set as a dictionary.
         :raises PyJWKClientConnectionError: If the HTTP request fails.
@@ -178,12 +188,6 @@ class PyJWKClient:
         # rather than as a malformed JWK Set.
         jwk_set = self._as_jwk_set_payload(jwk_set)
 
-        # Only update the cache on a successful fetch. Writing in a
-        # `finally` block with `jwk_set=None` on error clears any
-        # previously-cached JWKS, turning a transient outage into a cache
-        # wipe that breaks legitimate auth.
-        if self.jwk_set_cache is not None:
-            self.jwk_set_cache.put(jwk_set)
         self._last_successful_fetch = time.monotonic()
         return jwk_set
 
@@ -198,29 +202,35 @@ class PyJWKClient:
         :raises PyJWKClientError: If the endpoint does not return a JSON
             object.
         """
-        data = None
-        fetched = False
-        if self.jwk_set_cache is not None and not refresh:
-            data = self.jwk_set_cache.get()
+        with self._client_lock:
+            data = None
+            if self.jwk_set_cache is not None and not refresh:
+                data = self.jwk_set_cache.get()
 
-        if data is None:
-            data = self.fetch_data()
-            fetched = True
+            if data is not None:
+                # A cache hit is already parsed, so serve it as-is.
+                return data
 
-        # A cache hit is already parsed, so serve it as-is. Only a fresh
-        # fetch reaches the check below, which still matters because
-        # `fetch_data()` may be overridden by a subclass.
+        # Perform the network round-trip without holding the lock so other
+        # readers can keep using the current generation while we fetch.
+        # Anything raised here happens before publication, leaving any
+        # cached generation (and its original expiry) untouched.
+        data = self.fetch_data()
+
+        # A subclass may return an already-parsed, possibly transformed
+        # PyJWKSet; only raw payloads need parsing here.
         if isinstance(data, PyJWKSet):
             jwk_set = data
         else:
             jwk_set = PyJWKSet.from_dict(self._as_jwk_set_payload(data))
 
-        # `fetch_data()` caches the payload it received from the endpoint,
-        # but a subclass may filter or transform it before returning. Cache
-        # the value actually being returned, so later cache hits serve the
-        # same key set as this call rather than the pre-transform one.
-        if fetched and self.jwk_set_cache is not None:
-            self.jwk_set_cache.put(jwk_set)
+        with self._client_lock:
+            if self.jwk_set_cache is not None:
+                # Publish one complete generation atomically. Cache the
+                # value actually being returned (post-subclass-transform),
+                # so later cache hits serve exactly this key set.
+                self.jwk_set_cache.put(jwk_set)
+                self._signing_key_cache.clear()
 
         return jwk_set
 
@@ -267,6 +277,12 @@ class PyJWKClient:
         from the endpoint and the lookup is retried once when the refresh
         cooldown permits it.
 
+        When ``cache_keys`` is enabled, a resolved key is cached only for
+        the JWK Set generation it came from and only while that generation
+        is within its lifespan. A refresh publishes a new generation, so a
+        revoked ``kid`` raises rather than returning the stale key and a
+        rotated ``kid`` returns the replacement key.
+
         :param kid: The key ID to look up.
         :type kid: str
         :returns: The matching signing key.
@@ -275,7 +291,11 @@ class PyJWKClient:
             refreshing.
         """
         with self._client_lock:
-            signing_keys = self.get_signing_keys()
+            cached_key = self._get_cached_signing_key(kid)
+            if cached_key is not None:
+                return cached_key
+
+            entry, signing_keys = self._get_current_signing_keys()
             signing_key = self.match_kid(signing_keys, kid)
 
             if not signing_key:
@@ -288,6 +308,7 @@ class PyJWKClient:
                 if not cooling_down:
                     signing_keys = self.get_signing_keys(refresh=True)
                     self._last_successful_fetch = time.monotonic()
+                    entry = self._get_current_generation_entry()
                     signing_key = self.match_kid(signing_keys, kid)
 
                 if not signing_key:
@@ -295,7 +316,50 @@ class PyJWKClient:
                         f'Unable to find a signing key that matches: "{kid}"'
                     )
 
+            self._cache_signing_key(kid, entry, signing_key)
             return signing_key
+
+    def _get_current_generation_entry(self) -> Any:
+        if self.jwk_set_cache is None:
+            return None
+        return self.jwk_set_cache.get_entry()
+
+    def _get_current_signing_keys(self) -> tuple[Any, list[PyJWK]]:
+        jwk_set = self.get_jwk_set()
+        entry = self._get_current_generation_entry()
+        return entry, self._get_signing_keys_from_jwk_set(jwk_set)
+
+    def _get_cached_signing_key(self, kid: str) -> PyJWK | None:
+        if not self._cache_keys or self.jwk_set_cache is None:
+            return None
+
+        cached = self._signing_key_cache.get(kid)
+        if cached is None:
+            return None
+
+        entry, signing_key = cached
+        # Entries belong to one generation. A published replacement invalidates
+        # the whole key cache, and an expired generation must not be trusted.
+        if entry is not self._get_current_generation_entry():
+            del self._signing_key_cache[kid]
+            return None
+
+        self._signing_key_cache.move_to_end(kid)
+        return signing_key
+
+    def _cache_signing_key(self, kid: str, entry: Any, signing_key: PyJWK) -> None:
+        if not self._cache_keys or self.jwk_set_cache is None or entry is None:
+            return
+
+        # Never reinsert a key from a generation that has been superseded or
+        # expired while a fetch was in flight.
+        if entry is not self._get_current_generation_entry():
+            return
+
+        self._signing_key_cache[kid] = (entry, signing_key)
+        self._signing_key_cache.move_to_end(kid)
+        while len(self._signing_key_cache) > self._max_cached_keys:
+            self._signing_key_cache.popitem(last=False)
 
     def get_signing_key_from_jwt(self, token: str | bytes) -> PyJWK:
         """Return the signing key for a JWT by reading its ``kid`` header.

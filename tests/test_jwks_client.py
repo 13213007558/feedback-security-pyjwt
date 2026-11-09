@@ -14,13 +14,16 @@ from urllib.error import HTTPError, URLError
 from email.message import Message
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 import jwt
+from jwt.algorithms import RSAAlgorithm
 from jwt import PyJWKClient
 from jwt.jwks_client import _NoRedirectHandler
 from jwt.api_jwk import PyJWK, PyJWKSet
 from jwt.exceptions import (
     DecodeError,
+    InvalidSignatureError,
     PyJWKClientConnectionError,
     PyJWKClientError,
     PyJWKSetError,
@@ -147,6 +150,53 @@ def mocked_http_error_response() -> Iterator[tuple[mock.Mock, HTTPError]]:
         )
         urlopen_mock.side_effect = http_error
         yield urlopen_mock, http_error
+
+
+def make_rsa_jwk(kid: str) -> tuple[dict[str, Any], Any]:
+    """Generate a private RSA key and its public JWK, sharing *kid*."""
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = RSAAlgorithm(RSAAlgorithm.SHA256).to_jwk(
+        private_key.public_key(), as_dict=True
+    )
+    jwk.update({"kid": kid, "use": "sig", "alg": "RS256"})
+    return jwk, private_key
+
+
+def sign_rs256(private_key: Any, kid: str, payload: dict[str, Any]) -> str:
+    return jwt.encode(
+        payload,
+        private_key,
+        algorithm="RS256",
+        headers={"kid": kid},
+    )
+
+
+@contextlib.contextmanager
+def mocked_jwks_responses(payloads: list[object]) -> Iterator[mock.Mock]:
+    """Serve *payloads* (or raised exceptions) from successive HTTP calls."""
+    with mock.patch("urllib.request.build_opener") as build_opener_mock:
+        opener = mock.Mock()
+        build_opener_mock.return_value = opener
+        urlopen_mock = opener.open
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock()
+        response.read.side_effect = [
+            item if isinstance(item, BaseException) else json.dumps(item)
+            for item in payloads
+        ]
+        urlopen_mock.return_value = response
+        yield urlopen_mock
+
+
+class ControllableClock:
+    """Deterministic replacement for monotonic time; no real sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
 
 
 @crypto_required
@@ -466,6 +516,26 @@ class TestPyJWKClient:
         cache.put(None)
 
         assert cache.get() is None
+
+    def test_cache_each_publish_is_a_distinct_generation(self) -> None:
+        clock = ControllableClock()
+        cache = JWKSetCache(10)
+
+        with mock.patch("jwt.jwk_set_cache.time.monotonic", clock.monotonic):
+            cache.put(RESPONSE_DATA_WITH_MATCHING_KID)
+            first = cache.get_entry()
+            assert first is not None and cache.get() is first.get_jwk_set()
+
+            clock.now += 5
+            cache.put(RESPONSE_DATA_NO_MATCHING_KID)
+            second = cache.get_entry()
+            assert second is not None and second is not first
+
+            # A failed refresh never calls put(), so the generation and its
+            # original expiry remain unchanged.
+            clock.now += 11
+            assert cache.get_entry() is None
+            assert cache.is_expired()
 
     def test_get_jwk_set_raises_when_endpoint_does_not_return_an_object(self) -> None:
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
@@ -809,3 +879,301 @@ class TestPyJWKClient:
                 jwks_client.get_jwk_set()
 
             assert http_error.closed
+
+
+@crypto_required
+class TestJWKSetCacheContract:
+    """Generation-aware contract between PyJWKClient and JWKSetCache."""
+
+    url = "https://example.test/.well-known/jwks.json"
+
+    def _encode(self, private_key: Any, kid: str) -> str:
+        return sign_rs256(private_key, kid, {"sub": "subject", "iss": self.url})
+
+    def test_refresh_revokes_cached_kid_and_rejects_old_token(self) -> None:
+        # The original bug report: a key cached via cache_keys=True kept
+        # being returned after get_jwk_set(refresh=True) published a set
+        # that no longer contains its kid.
+        old_jwk, old_private = make_rsa_jwk("kid-1")
+        new_jwk, new_private = make_rsa_jwk("kid-2")
+        old_token = self._encode(old_private, "kid-1")
+        new_token = self._encode(new_private, "kid-2")
+
+        client = PyJWKClient(self.url, cache_keys=True)
+        with mocked_jwks_responses([{"keys": [old_jwk]}, {"keys": [new_jwk]}]):
+            old_key = client.get_signing_key("kid-1")
+            client.get_jwk_set(refresh=True)
+
+            with pytest.raises(PyJWKClientError, match="matches"):
+                client.get_signing_key("kid-1")
+            new_key = client.get_signing_key("kid-2")
+
+        # Both keys prove the final verification decision, not just identity.
+        with pytest.raises(InvalidSignatureError):
+            jwt.decode(
+                old_token,
+                new_key.key,
+                algorithms=["RS256"],
+                options={"verify_exp": False},
+            )
+        jwt.decode(
+            new_token,
+            new_key.key,
+            algorithms=["RS256"],
+            options={"verify_exp": False},
+        )
+        assert old_key is not new_key
+
+    def test_same_kid_with_rotated_material_returns_new_key(self) -> None:
+        old_jwk, old_private = make_rsa_jwk("stable-kid")
+        new_jwk, new_private = make_rsa_jwk("stable-kid")
+        old_token = self._encode(old_private, "stable-kid")
+        new_token = self._encode(new_private, "stable-kid")
+
+        client = PyJWKClient(self.url, cache_keys=True)
+        with mocked_jwks_responses([{"keys": [old_jwk]}, {"keys": [new_jwk]}]) as calls:
+            old_key = client.get_signing_key("stable-kid")
+            client.get_jwk_set(refresh=True)
+            new_key = client.get_signing_key("stable-kid")
+
+        assert new_key is not old_key
+        assert calls.call_count == 2
+        with pytest.raises(InvalidSignatureError):
+            jwt.decode(
+                old_token,
+                new_key.key,
+                algorithms=["RS256"],
+                options={"verify_exp": False},
+            )
+        jwt.decode(
+            new_token,
+            new_key.key,
+            algorithms=["RS256"],
+            options={"verify_exp": False},
+        )
+
+    def test_failed_refresh_keeps_generation_and_original_expiry(self) -> None:
+        old_jwk, _ = make_rsa_jwk("kid-1")
+        clock = ControllableClock()
+        client = PyJWKClient(self.url, lifespan=10, cooldown_duration=30)
+
+        with (
+            mock.patch("jwt.jwks_client.time.monotonic", clock.monotonic),
+            mock.patch("jwt.jwk_set_cache.time.monotonic", clock.monotonic),
+        ):
+            with mocked_jwks_responses([{"keys": [old_jwk]}]):
+                client.get_jwk_set()
+            entry = client.jwk_set_cache.get_entry()
+            assert entry is not None
+            original_expiry = entry.get_timestamp() + client.jwk_set_cache.lifespan
+
+            clock.now += 5
+            with mocked_failed_response():
+                with pytest.raises(PyJWKClientConnectionError):
+                    client.get_jwk_set(refresh=True)
+
+            surviving = client.jwk_set_cache.get_entry()
+            assert surviving is entry
+            assert surviving.get_timestamp() + client.jwk_set_cache.lifespan == (
+                original_expiry
+            )
+
+            # The unexpired good generation still serves without a fetch.
+            with mocked_jwks_responses([]) as calls:
+                assert client.get_signing_key("kid-1").key_id == "kid-1"
+            assert calls.call_count == 0
+
+    def test_bad_payloads_never_replace_or_extend_cached_generation(self) -> None:
+        good_jwk, _ = make_rsa_jwk("kid-1")
+        clock = ControllableClock()
+        client = PyJWKClient(self.url, lifespan=10)
+
+        with (
+            mock.patch("jwt.jwks_client.time.monotonic", clock.monotonic),
+            mock.patch("jwt.jwk_set_cache.time.monotonic", clock.monotonic),
+        ):
+            with mocked_jwks_responses([{"keys": [good_jwk]}]):
+                client.get_jwk_set()
+            entry = client.jwk_set_cache.get_entry()
+            original_expiry = entry.get_timestamp() + client.jwk_set_cache.lifespan
+
+            clock.now += 5
+            with mocked_jwks_responses(["not-json"]):
+                with pytest.raises(PyJWKClientError):
+                    client.get_jwk_set(refresh=True)
+            with mocked_jwks_responses([{"keys": []}]):
+                with pytest.raises(PyJWKSetError):
+                    client.get_jwk_set(refresh=True)
+
+            assert client.jwk_set_cache.get_entry() is entry
+            assert (
+                entry.get_timestamp() + client.jwk_set_cache.lifespan == original_expiry
+            )
+
+            # Reaching the original lifespan still expires the old generation.
+            clock.now = original_expiry + 1
+            assert client.jwk_set_cache.get_entry() is None
+
+    def test_expired_generation_fails_loudly_when_refresh_fails(self) -> None:
+        good_jwk, _ = make_rsa_jwk("kid-1")
+        clock = ControllableClock()
+        client = PyJWKClient(self.url, cache_keys=True, lifespan=10)
+
+        with (
+            mock.patch("jwt.jwks_client.time.monotonic", clock.monotonic),
+            mock.patch("jwt.jwk_set_cache.time.monotonic", clock.monotonic),
+        ):
+            with mocked_jwks_responses([{"keys": [good_jwk]}]):
+                client.get_signing_key("kid-1")
+
+            clock.now += 11
+            with mocked_failed_response():
+                with pytest.raises(PyJWKClientConnectionError):
+                    client.get_signing_key("kid-1")
+
+            # No stale key remains reachable once the generation expired.
+            assert client.jwk_set_cache.get_entry() is None
+            assert client._signing_key_cache == {}
+
+    def test_unknown_kid_cooldown_and_key_cache_capacity_are_preserved(self) -> None:
+        jwks = [make_rsa_jwk(f"kid-{index}")[0] for index in range(4)]
+        clock = ControllableClock()
+        client = PyJWKClient(
+            self.url,
+            cache_keys=True,
+            max_cached_keys=2,
+            cooldown_duration=30,
+        )
+
+        with (
+            mock.patch("jwt.jwks_client.time.monotonic", clock.monotonic),
+            mock.patch("jwt.jwk_set_cache.time.monotonic", clock.monotonic),
+            mocked_jwks_responses(
+                [
+                    {"keys": jwks},
+                    {"keys": jwks},
+                    {"keys": jwks},
+                ]
+            ) as calls,
+        ):
+            client.get_signing_key("kid-0")
+            for _ in range(3):
+                with pytest.raises(PyJWKClientError, match="matches"):
+                    client.get_signing_key("missing-kid")
+            assert calls.call_count == 1
+
+            # LRU capacity is enforced within the single generation.
+            client.get_signing_key("kid-1")
+            client.get_signing_key("kid-2")
+            assert list(client._signing_key_cache) == ["kid-1", "kid-2"]
+
+            clock.now += 31
+            with pytest.raises(PyJWKClientError, match="matches"):
+                client.get_signing_key("missing-kid")
+            assert calls.call_count == 2
+
+    def test_cache_flag_combinations_have_explicit_behavior(self) -> None:
+        jwk, _ = make_rsa_jwk("kid-1")
+        payload = {"keys": [jwk]}
+
+        # Both caches on: a second lookup is served from the key cache.
+        client = PyJWKClient(self.url, cache_keys=True, cache_jwk_set=True)
+        with mocked_jwks_responses([payload, payload]) as calls:
+            client.get_signing_key("kid-1")
+            client.get_signing_key("kid-1")
+        assert calls.call_count == 1
+        assert len(client._signing_key_cache) == 1
+
+        # Only the set cache: every key lookup walks the cached set.
+        client = PyJWKClient(self.url, cache_keys=False, cache_jwk_set=True)
+        with mocked_jwks_responses([payload, payload]) as calls:
+            client.get_signing_key("kid-1")
+            client.get_signing_key("kid-1")
+        assert calls.call_count == 1
+        assert client._signing_key_cache == {}
+
+        # Set cache disabled, key cache requested: no TTL-bearing generation
+        # exists, so there must be no unbounded key-cache bypass.
+        client = PyJWKClient(
+            self.url, cache_keys=True, cache_jwk_set=False, cooldown_duration=0
+        )
+        with mocked_jwks_responses([payload, payload]) as calls:
+            client.get_signing_key("kid-1")
+            client.get_signing_key("kid-1")
+        assert calls.call_count == 2
+        assert client._signing_key_cache == {}
+
+        # Both caches off: every lookup fetches directly.
+        client = PyJWKClient(
+            self.url, cache_keys=False, cache_jwk_set=False, cooldown_duration=0
+        )
+        with mocked_jwks_responses([payload, payload]) as calls:
+            client.get_signing_key("kid-1")
+            client.get_signing_key("kid-1")
+        assert calls.call_count == 2
+
+    def test_overlapping_lookup_cannot_reinsert_a_published_generation(self) -> None:
+        old_jwk, _ = make_rsa_jwk("kid-1")
+        new_jwk, _ = make_rsa_jwk("kid-2")
+        client = PyJWKClient(self.url, cache_keys=True)
+        refresh_in_flight = threading.Event()
+        lookup_started = threading.Event()
+        release_fetch = threading.Event()
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            responses = [
+                mock.Mock(read=mock.Mock(return_value=json.dumps({"keys": [old_jwk]}))),
+                mock.Mock(read=mock.Mock(return_value=json.dumps({"keys": [new_jwk]}))),
+            ]
+            for response in responses:
+                response.__enter__ = mock.Mock(return_value=response)
+                response.__exit__ = mock.Mock()
+
+            def open_response(*args: object, **kwargs: object) -> mock.Mock:
+                response = responses[opener.open.call_count - 1]
+                if opener.open.call_count == 2:
+                    refresh_in_flight.set()
+                    lookup_started.wait(timeout=5)
+                    release_fetch.wait(timeout=5)
+                return response
+
+            opener.open.side_effect = open_response
+
+            client.get_signing_key("kid-1")
+            assert list(client._signing_key_cache) == ["kid-1"]
+
+            refresh_result: list[Any] = []
+            overlapping_result: list[Any] = []
+
+            def refresh() -> None:
+                refresh_result.append(client.get_jwk_set(refresh=True))
+
+            def overlapping_lookup() -> None:
+                refresh_in_flight.wait(timeout=5)
+                lookup_started.set()
+                # Starts while the new generation is being fetched; it is
+                # serialized against publication by the client lock.
+                overlapping_result.append(client.get_signing_key("kid-1"))
+
+            refresher = threading.Thread(target=refresh)
+            lookup = threading.Thread(target=overlapping_lookup)
+            refresher.start()
+            refresh_in_flight.wait(timeout=5)
+            lookup.start()
+            # The lookup has entered get_signing_key before publication is
+            # released, and the client lock defines the final ordering.
+            release_fetch.set()
+            refresher.join(timeout=5)
+            lookup.join(timeout=5)
+
+            assert not refresher.is_alive()
+            assert not lookup.is_alive()
+            assert opener.open.call_count == 2
+            # The old-generation key was allowed for the overlapping lookup,
+            # but must not have been cached against the new generation.
+            assert overlapping_result[0].key_id == "kid-1"
+            assert client._signing_key_cache == {}
+            with pytest.raises(PyJWKClientError, match="matches"):
+                client.get_signing_key("kid-1")
